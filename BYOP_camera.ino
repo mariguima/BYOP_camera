@@ -1,5 +1,6 @@
 #include "esp_camera.h"
 #include <WiFi.h>
+#include <wifi_config.h>
 #include "DFRobot_AXP313A.h"
 
 
@@ -38,8 +39,8 @@
 // ===========================
 // Enter your WiFi credentials
 // ===========================
-const char *ssid = "erick";
-const char *password = "vvpu8768";
+const char *ssid = STASSID;
+const char *password = STAPSK;
 
 
 DFRobot_AXP313A axp;
