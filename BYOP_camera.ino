@@ -3,6 +3,12 @@
 #include <HTTPClient.h>
 #include "DFRobot_AXP313A.h"
 #include "model_data.h"
+#include <Arduino_JSON.h>
+#include <Preferences.h>
+#include <time.h>
+#include <WiFiManager.h> // https://github.com/tzapu/WiFiManager
+
+#define CONFIG_PORTAL_TIMEOUT 180
 
 #define CAMERA_MODEL_DFRobot_FireBeetle2_ESP32S3  // Has PSRAM
 #include "camera_pins.h"
@@ -15,20 +21,27 @@
 #define INPUT_WIDTH      96
 #define INPUT_HEIGHT     96
 #define NUMBER_OF_INPUTS (INPUT_WIDTH * INPUT_HEIGHT)  // 9216 — grayscale pixels
-#define NUMBER_OF_OUTPUTS 2                            // 0 = No-Fall, 1 = Fall
-#define ARENA_SIZE       64                            // KB — increase if inference crashes
+#define NUMBER_OF_OUTPUTS 1                        // 0 = No-Fall, 1 = Fall
+#define ARENA_SIZE       (100 * 1024)                  // bytes — increase if inference crashes
 
 // ─── Detection thresholds ─────────────────────────────────────────────────────
 #define FALL_CONFIDENCE_THRESHOLD 0.85f  // Minimum confidence to trigger alert
-#define INFERENCE_INTERVAL_MS     500    // Run inference every 500 ms
+#define INFERENCE_INTERVAL_MS     2000   // Run inference every 2 s
 
-// ─── Android app endpoint — change to your phone's IP on the same WiFi ────────
-// If using a backend/server, replace with your server URL
-#define ANDROID_ALERT_URL "http://192.168.x.x:8080/fall-alert"
+// ─── Debug stream toggle ──────────────────────────────────────────────────────
+// Camera can only be in one pixel format at a time. Grayscale is required for
+// inference, so the JPEG debug stream is disabled by default. Flip to true,
+// reflash, and check :81/stream to verify camera framing — then flip back.
+#define DEBUG_STREAM_ENABLED false
 
-// ─── WiFi credentials ─────────────────────────────────────────────────────────
-const char *ssid     = "namie";
-const char *password = "mariguima";
+// find the ip by running 'ipconfig' on terminal
+// ensure server is running on the same network as the ESP (mobile hotspot works)
+String SERVER_REGISTER_URL = "https://server-fall-detection-app.onrender.com/api/v1/devices";
+String SERVER_ALERT_URL    = "https://server-fall-detection-app.onrender.com/api/v1/events";
+
+Preferences prefs;
+String apiKey   = "";
+String deviceId = "";
 
 // ─── Globals ──────────────────────────────────────────────────────────────────
 DFRobot_AXP313A axp;
@@ -41,13 +54,20 @@ void startCameraServer();
 void setupLedFlash(int pin);
 void runInference();
 bool captureAndPreprocess();
-void sendFallAlert(float confidence);
+void setupTime();
+void setupApiKey(const char* userEmail);
+String registerDevice(const char* userEmail);
+bool sendFallAlert();
+String getDeviceId();
 
 // ─────────────────────────────────────────────────────────────────────────────
 void setup() {
   Serial.begin(115200);
   Serial.setDebugOutput(true);
   Serial.println();
+
+  deviceId = getDeviceId();
+  Serial.println("Device ID: " + deviceId);
 
   // ── Power management (must happen BEFORE esp_camera_init) ──────────────────
   while (axp.begin() != 0) {
@@ -81,18 +101,24 @@ void setup() {
   config.fb_location   = CAMERA_FB_IN_PSRAM;
   config.fb_count      = 1;
 
-  // Use GRAYSCALE for inference (matches 96x96 model input)
-  // The camera server will still serve JPEG — we switch format per-task below
-  config.pixel_format  = PIXFORMAT_JPEG;
-  config.frame_size    = FRAMESIZE_UXGA;
-  config.jpeg_quality  = 12;
+  // Camera runs in ONE format for the whole session — grayscale for inference,
+  // or JPEG if you're temporarily debugging the live stream (see DEBUG_STREAM_ENABLED).
+  if (DEBUG_STREAM_ENABLED) {
+    config.pixel_format = PIXFORMAT_JPEG;
+    config.frame_size   = FRAMESIZE_QVGA;
+    config.jpeg_quality = 12;
+  } else {
+    config.pixel_format = PIXFORMAT_GRAYSCALE;
+    config.frame_size   = FRAMESIZE_96X96;
+  }
 
   if (psramFound()) {
-    config.jpeg_quality = 10;
-    config.fb_count     = 2;
-    config.grab_mode    = CAMERA_GRAB_LATEST;
+    if (DEBUG_STREAM_ENABLED) {
+      config.jpeg_quality = 10;
+    }
+    config.fb_count  = 2;
+    config.grab_mode = CAMERA_GRAB_LATEST;
   } else {
-    config.frame_size  = FRAMESIZE_SVGA;
     config.fb_location = CAMERA_FB_IN_DRAM;
   }
 
@@ -113,9 +139,6 @@ void setup() {
     s->set_brightness(s, 1);
     s->set_saturation(s, -2);
   }
-  if (config.pixel_format == PIXFORMAT_JPEG) {
-    s->set_framesize(s, FRAMESIZE_QVGA);
-  }
 
 #if defined(CAMERA_MODEL_M5STACK_WIDE) || defined(CAMERA_MODEL_M5STACK_ESP32CAM)
   s->set_vflip(s, 1);
@@ -131,14 +154,31 @@ void setup() {
 #endif
 
   // ── WiFi ───────────────────────────────────────────────────────────────────
-  WiFi.begin(ssid, password);
-  WiFi.setSleep(false);
-  Serial.print("WiFi connecting");
-  while (WiFi.status() != WL_CONNECTED) {
-    delay(500);
-    Serial.print(".");
+  WiFiManager wm;
+  WiFiManagerParameter custom_email("email", "your email", "mari@gmail.com", 254);
+  wm.addParameter(&custom_email);
+  Serial.println("Stored SSID: " + wm.getWiFiSSID());
+  Serial.println("Stored pass length: " + String(wm.getWiFiPass().length()));
+  wm.setConnectTimeout(20);
+  wm.setDebugOutput(true);
+  wm.setConfigPortalTimeout(CONFIG_PORTAL_TIMEOUT);
+
+  bool res = wm.autoConnect("AutoConnectAP", "password");
+
+  if (!res) {
+    Serial.println("Failed to connect");
+    delay(1000);
+    ESP.restart();
   }
-  Serial.println("\nWiFi connected — IP: " + WiFi.localIP().toString());
+
+  Serial.println("WiFi connected — IP: " + WiFi.localIP().toString());
+
+  const char* userEmail = custom_email.getValue();
+  Serial.print("User email: ");
+  Serial.println(userEmail);
+
+  setupTime();              // sync clock for reliable timestamps
+  setupApiKey(userEmail);   // load or register API key
 
   // ── TFLite model init ──────────────────────────────────────────────────────
   while (!tf.begin(fall_detection_model_tflite).isOk()) {
@@ -147,11 +187,13 @@ void setup() {
   }
   Serial.println("TFLite model loaded successfully");
 
-  // ── Camera web server (runs in its own FreeRTOS task) ─────────────────────
-  startCameraServer();
-  Serial.print("Camera stream: http://");
-  Serial.print(WiFi.localIP());
-  Serial.println(":81/stream");
+  // ── Camera web server (debug only — see DEBUG_STREAM_ENABLED) ─────────────
+  if (DEBUG_STREAM_ENABLED) {
+    startCameraServer();
+    Serial.print("Camera stream: http://");
+    Serial.print(WiFi.localIP());
+    Serial.println(":81/stream");
+  }
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -163,19 +205,19 @@ void loop() {
     runInference();
   }
 
+  // Keep WiFi alive / handle reconnects
+  if (WiFi.status() != WL_CONNECTED) {
+    Serial.println("WiFi disconnected — attempting reconnect...");
+    WiFi.reconnect();
+  }
+
   delay(10);
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
-// Capture a GRAYSCALE frame, resize to 96×96, normalise to [0,1], fill buffer
+// Capture a GRAYSCALE frame, normalise to [0,1], fill buffer
 // ─────────────────────────────────────────────────────────────────────────────
 bool captureAndPreprocess() {
-  // Temporarily switch to GRAYSCALE for inference capture
-  sensor_t *s = esp_camera_sensor_get();
-  s->set_framesize(s, FRAMESIZE_96X96);  // 96×96 native — no software resize needed
-
-  // Re-init pixel format to GRAYSCALE just for this capture
-  // (The web server uses JPEG; we restore below)
   camera_fb_t *fb = esp_camera_fb_get();
   if (!fb) {
     Serial.println("Camera capture failed");
@@ -183,7 +225,6 @@ bool captureAndPreprocess() {
   }
 
   if (fb->format != PIXFORMAT_GRAYSCALE) {
-    // If the frame isn't grayscale (e.g. still JPEG), skip this cycle
     esp_camera_fb_return(fb);
     Serial.println("Warning: frame not grayscale — check pixel_format config");
     return false;
@@ -215,44 +256,140 @@ void runInference() {
     return;
   }
 
-  float prob_no_fall = tf.output(0);
-  float prob_fall    = tf.output(1);
+  float prob_fall = tf.output(0);  // single sigmoid output: probability of "fall"
 
-  Serial.printf("[Inference] No-Fall: %.2f  |  Fall: %.2f\n", prob_no_fall, prob_fall);
+  Serial.printf("[Inference] Fall probability: %.2f\n", prob_fall);
 
   if (prob_fall >= FALL_CONFIDENCE_THRESHOLD) {
     Serial.println(">>> FALL DETECTED — sending alert");
-    sendFallAlert(prob_fall);
+    sendFallAlert();
   }
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
-// Send HTTP POST alert to Android app
+// Syncs internal clock for reliable timestamps
 // ─────────────────────────────────────────────────────────────────────────────
-void sendFallAlert(float confidence) {
-  if (WiFi.status() != WL_CONNECTED) {
-    Serial.println("WiFi not connected — alert not sent");
-    return;
+void setupTime() {
+  configTime(0, 0, "pool.ntp.org", "time.nist.gov");  // UTC, no DST
+
+  Serial.print("Waiting for NTP time sync");
+  time_t now = time(nullptr);
+  while (now < 1700000000) {  // arbitrary "sane" epoch threshold (Nov 2023+)
+    delay(500);
+    Serial.print(".");
+    now = time(nullptr);
+  }
+  Serial.println();
+  Serial.println("Time synced: " + String(now));
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Returns a stable hex string for this device's unique MAC-derived ID
+// ─────────────────────────────────────────────────────────────────────────────
+String getDeviceId() {
+  uint64_t mac = ESP.getEfuseMac();
+  char idStr[17];
+  // Format as a 12-character hex MAC string (consistent across all uses)
+  snprintf(idStr, sizeof(idStr), "%04X%08X",
+           (uint16_t)(mac >> 32), (uint32_t)mac);
+  return String(idStr);
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Retrieve saved API key (gets it from server if not saved)
+// ─────────────────────────────────────────────────────────────────────────────
+void setupApiKey(const char* userEmail) {
+  prefs.begin("device", false);  // namespace "device", read-write mode
+  apiKey = prefs.getString("api_key", "");  // "" = default if not found
+
+  if (apiKey == "") {
+    Serial.println("No API key found — registering with server...");
+    apiKey = registerDevice(userEmail);
+
+    if (apiKey != "") {
+      prefs.putString("api_key", apiKey);
+      Serial.println("API key saved: " + apiKey);
+    } else {
+      Serial.println("Registration failed; will retry next boot");
+    }
+  } else {
+    Serial.println("Loaded existing API key: " + apiKey);
   }
 
-  HTTPClient http;
-  http.begin(ANDROID_ALERT_URL);
-  http.addHeader("Content-Type", "application/json");
-  http.setTimeout(3000);  // 3 s timeout — don't block inference loop
+  prefs.end();
+}
 
-  // Build JSON payload
-  char payload[128];
-  snprintf(payload, sizeof(payload),
-           "{\"event\":\"fall\",\"confidence\":%.2f,\"device\":\"esp32s3\"}",
-           confidence);
+// ─────────────────────────────────────────────────────────────────────────────
+// Registers ESP32 in the server and returns its unique API key
+// ─────────────────────────────────────────────────────────────────────────────
+String registerDevice(const char* userEmail) {
+  HTTPClient http;
+  http.begin(SERVER_REGISTER_URL);
+  http.addHeader("Content-Type", "application/json");
+
+  JSONVar payloadObj;
+  payloadObj["deviceId"]  = deviceId;
+  payloadObj["userEmail"] = userEmail;
+  String payload = JSON.stringify(payloadObj);
 
   int httpCode = http.POST(payload);
+  String result = "";
 
-  if (httpCode > 0) {
-    Serial.printf("Alert sent — HTTP %d\n", httpCode);
+  if (httpCode == 201 || httpCode == 409) {  // created or already exists
+    String response = http.getString();
+    Serial.println(response);
+    JSONVar doc = JSON.parse(response);
+
+    if (JSON.typeof(doc) == "undefined") {
+      Serial.println("JSON parse failed");
+    } else {
+      result = String((const char*) doc["apiKey"]);
+    }
   } else {
-    Serial.printf("Alert failed — error: %s\n", http.errorToString(httpCode).c_str());
+    Serial.printf("Registration HTTP error: %d\n", httpCode);
   }
 
   http.end();
+  return result;
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Send HTTP POST alert to server
+// ─────────────────────────────────────────────────────────────────────────────
+bool sendFallAlert() {
+  if (WiFi.status() != WL_CONNECTED) {
+    Serial.println("WiFi is not connected.");
+    return false;
+  }
+
+  if (apiKey == "") {
+    Serial.println("No API key available.");
+    return false;
+  }
+
+  JSONVar payloadObj;
+  payloadObj["deviceId"]   = deviceId;
+  payloadObj["timestamp"]  = (long) time(nullptr);
+  String payload = JSON.stringify(payloadObj);
+
+  HTTPClient http;
+  http.begin(SERVER_ALERT_URL);
+  http.addHeader("Content-Type", "application/json");
+  http.addHeader("x-api-key", apiKey);
+
+  int httpCode = http.POST(payload);
+  bool success = false;
+
+  if (httpCode == 201) {
+    String response = http.getString();
+    Serial.println(response);
+    success = true;
+  } else {
+    String response = http.getString();
+    Serial.printf("Alert failed — HTTP %d\n", httpCode);
+    Serial.println(response);
+  }
+
+  http.end();
+  return success;
 }
