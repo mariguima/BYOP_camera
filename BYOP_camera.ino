@@ -14,19 +14,22 @@
 #include "camera_pins.h"
 
 // ─── TFLite Micro includes ────────────────────────────────────────────────────
+// Raw TFLite Micro — no Eloquent wrapper, so arena can live in PSRAM
 #include <tflm_esp32.h>
-#include <eloquent_tinyml.h>
+#include "tensorflow/lite/micro/micro_interpreter.h"
+#include "tensorflow/lite/micro/micro_mutable_op_resolver.h"
+#include "tensorflow/lite/schema/schema_generated.h"
 
 // ─── Model specifications ─────────────────────────────────────────────────────
-#define INPUT_WIDTH      96
-#define INPUT_HEIGHT     96
-#define NUMBER_OF_INPUTS (INPUT_WIDTH * INPUT_HEIGHT)  // 9216 — grayscale pixels
-#define NUMBER_OF_OUTPUTS 1                        // 0 = No-Fall, 1 = Fall
-#define ARENA_SIZE       (100 * 1024)                  // bytes — increase if inference crashes
+#define INPUT_WIDTH       96
+#define INPUT_HEIGHT      96
+#define NUMBER_OF_INPUTS  (INPUT_WIDTH * INPUT_HEIGHT)  // 9216 — grayscale pixels
+#define NUMBER_OF_OUTPUTS 1                             // sigmoid output: P(fall)
+#define ARENA_SIZE        (380 * 1024)                  // allocated in PSRAM at runtime
 
 // ─── Detection thresholds ─────────────────────────────────────────────────────
 #define FALL_CONFIDENCE_THRESHOLD 0.85f  // Minimum confidence to trigger alert
-#define INFERENCE_INTERVAL_MS     2000   // Run inference every 2 s
+#define INFERENCE_INTERVAL_MS     5000   // Run inference every 2 s
 
 // ─── Debug stream toggle ──────────────────────────────────────────────────────
 // Camera can only be in one pixel format at a time. Grayscale is required for
@@ -34,8 +37,6 @@
 // reflash, and check :81/stream to verify camera framing — then flip back.
 #define DEBUG_STREAM_ENABLED false
 
-// find the ip by running 'ipconfig' on terminal
-// ensure server is running on the same network as the ESP (mobile hotspot works)
 String SERVER_REGISTER_URL = "https://server-fall-detection-app.onrender.com/api/v1/devices";
 String SERVER_ALERT_URL    = "https://server-fall-detection-app.onrender.com/api/v1/events";
 
@@ -45,9 +46,15 @@ String deviceId = "";
 
 // ─── Globals ──────────────────────────────────────────────────────────────────
 DFRobot_AXP313A axp;
-Eloquent::TF::Sequential<10, ARENA_SIZE> tf;
 
-static float    input_buffer[NUMBER_OF_INPUTS];
+// TFLite Micro — pointers only; arena lives in PSRAM, not DRAM
+static uint8_t*                          tensor_arena = nullptr;
+static const tflite::Model*              model_ptr    = nullptr;
+static tflite::MicroInterpreter*         interpreter  = nullptr;
+static tflite::MicroMutableOpResolver<7> resolver;
+
+// Small input buffer in DRAM is fine — only 9216 bytes
+static int8_t   input_buffer[NUMBER_OF_INPUTS];
 static uint32_t last_inference_ms = 0;
 
 void startCameraServer();
@@ -101,8 +108,6 @@ void setup() {
   config.fb_location   = CAMERA_FB_IN_PSRAM;
   config.fb_count      = 1;
 
-  // Camera runs in ONE format for the whole session — grayscale for inference,
-  // or JPEG if you're temporarily debugging the live stream (see DEBUG_STREAM_ENABLED).
   if (DEBUG_STREAM_ENABLED) {
     config.pixel_format = PIXFORMAT_JPEG;
     config.frame_size   = FRAMESIZE_QVGA;
@@ -113,9 +118,7 @@ void setup() {
   }
 
   if (psramFound()) {
-    if (DEBUG_STREAM_ENABLED) {
-      config.jpeg_quality = 10;
-    }
+    if (DEBUG_STREAM_ENABLED) config.jpeg_quality = 10;
     config.fb_count  = 2;
     config.grab_mode = CAMERA_GRAB_LATEST;
   } else {
@@ -177,15 +180,51 @@ void setup() {
   Serial.print("User email: ");
   Serial.println(userEmail);
 
-  setupTime();              // sync clock for reliable timestamps
-  setupApiKey(userEmail);   // load or register API key
+  setupTime();            // sync clock for reliable timestamps
+  setupApiKey(userEmail); // load or register API key
 
   // ── TFLite model init ──────────────────────────────────────────────────────
-  while (!tf.begin(fall_detection_model_tflite).isOk()) {
-    Serial.println("TFLite model load failed: " + tf.exception.toString());
-    delay(1000);
+
+  // 1. Allocate arena in PSRAM — avoids DRAM overflow
+  Serial.printf("Free PSRAM before arena: %d bytes\n", ESP.getFreePsram());
+  tensor_arena = (uint8_t*) ps_malloc(ARENA_SIZE);
+  if (!tensor_arena) {
+    Serial.println("PSRAM arena allocation failed — halting");
+    while (true) delay(1000);
   }
+  Serial.printf("Arena allocated: %d KB in PSRAM\n", ARENA_SIZE / 1024);
+
+  // 2. Load and validate model
+  model_ptr = tflite::GetModel(fall_detection_model_tflite);
+  if (model_ptr->version() != TFLITE_SCHEMA_VERSION) {
+    Serial.printf("Model schema mismatch: got %d, expected %d\n",
+                  model_ptr->version(), TFLITE_SCHEMA_VERSION);
+    while (true) delay(1000);
+  }
+
+  // 3. Register ops — must match exactly what the model uses
+  resolver.AddConv2D();
+  resolver.AddMaxPool2D();
+  resolver.AddFullyConnected();
+  resolver.AddReshape();
+  resolver.AddQuantize();
+  resolver.AddDequantize();
+  resolver.AddLogistic();   // sigmoid output layer
+
+  // 4. Build interpreter and allocate tensors
+  static tflite::MicroInterpreter static_interpreter(
+      model_ptr, resolver, tensor_arena, ARENA_SIZE
+  );
+  interpreter = &static_interpreter;
+
+  if (interpreter->AllocateTensors() != kTfLiteOk) {
+    Serial.println("AllocateTensors() failed — halting");
+    while (true) delay(1000);
+  }
+
   Serial.println("TFLite model loaded successfully");
+  Serial.printf("Arena used: %d bytes of %d\n",
+                interpreter->arena_used_bytes(), ARENA_SIZE);
 
   // ── Camera web server (debug only — see DEBUG_STREAM_ENABLED) ─────────────
   if (DEBUG_STREAM_ENABLED) {
@@ -215,7 +254,7 @@ void loop() {
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
-// Capture a GRAYSCALE frame, normalise to [0,1], fill buffer
+// Capture a GRAYSCALE frame and convert uint8 [0,255] → int8 [-128,127]
 // ─────────────────────────────────────────────────────────────────────────────
 bool captureAndPreprocess() {
   camera_fb_t *fb = esp_camera_fb_get();
@@ -236,9 +275,9 @@ bool captureAndPreprocess() {
     return false;
   }
 
-  // Normalise uint8 [0,255] → float [0.0, 1.0]
+  // Shift uint8 [0,255] → int8 [-128,127] to match int8 quantized model input
   for (int i = 0; i < NUMBER_OF_INPUTS; i++) {
-    input_buffer[i] = fb->buf[i] / 255.0f;
+    input_buffer[i] = (int8_t)(fb->buf[i] - 128);
   }
 
   esp_camera_fb_return(fb);
@@ -251,12 +290,22 @@ bool captureAndPreprocess() {
 void runInference() {
   if (!captureAndPreprocess()) return;
 
-  if (!tf.predict(input_buffer).isOk()) {
-    Serial.println("Inference error: " + tf.exception.toString());
+  // Copy preprocessed pixels into the model's input tensor
+  TfLiteTensor* input_tensor = interpreter->input(0);
+  memcpy(input_tensor->data.int8, input_buffer, NUMBER_OF_INPUTS);
+
+  // Run inference
+  if (interpreter->Invoke() != kTfLiteOk) {
+    Serial.println("Inference failed!");
     return;
   }
 
-  float prob_fall = tf.output(0);  // single sigmoid output: probability of "fall"
+  // Dequantize int8 output → float probability using tensor's own scale/zero_point
+  TfLiteTensor* output_tensor = interpreter->output(0);
+  int8_t  raw        = output_tensor->data.int8[0];
+  float   scale      = output_tensor->params.scale;
+  int32_t zero_point = output_tensor->params.zero_point;
+  float   prob_fall  = (raw - zero_point) * scale;
 
   Serial.printf("[Inference] Fall probability: %.2f\n", prob_fall);
 
@@ -289,18 +338,17 @@ void setupTime() {
 String getDeviceId() {
   uint64_t mac = ESP.getEfuseMac();
   char idStr[17];
-  // Format as a 12-character hex MAC string (consistent across all uses)
   snprintf(idStr, sizeof(idStr), "%04X%08X",
            (uint16_t)(mac >> 32), (uint32_t)mac);
   return String(idStr);
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
-// Retrieve saved API key (gets it from server if not saved)
+// Retrieve saved API key (registers with server if not saved)
 // ─────────────────────────────────────────────────────────────────────────────
 void setupApiKey(const char* userEmail) {
-  prefs.begin("device", false);  // namespace "device", read-write mode
-  apiKey = prefs.getString("api_key", "");  // "" = default if not found
+  prefs.begin("device", false);
+  apiKey = prefs.getString("api_key", "");
 
   if (apiKey == "") {
     Serial.println("No API key found — registering with server...");
@@ -320,7 +368,7 @@ void setupApiKey(const char* userEmail) {
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
-// Registers ESP32 in the server and returns its unique API key
+// Registers ESP32 with the server and returns its unique API key
 // ─────────────────────────────────────────────────────────────────────────────
 String registerDevice(const char* userEmail) {
   HTTPClient http;
@@ -368,8 +416,8 @@ bool sendFallAlert() {
   }
 
   JSONVar payloadObj;
-  payloadObj["deviceId"]   = deviceId;
-  payloadObj["timestamp"]  = (long) time(nullptr);
+  payloadObj["deviceId"]  = deviceId;
+  payloadObj["timestamp"] = (long) time(nullptr);
   String payload = JSON.stringify(payloadObj);
 
   HTTPClient http;
