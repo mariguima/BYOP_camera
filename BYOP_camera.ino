@@ -1,73 +1,49 @@
 #include "esp_camera.h"
+#include "img_converters.h"
 #include <WiFi.h>
 #include <HTTPClient.h>
 #include "DFRobot_AXP313A.h"
-#include "model_data.h"
 #include <Arduino_JSON.h>
 #include <Preferences.h>
 #include <time.h>
 #include <WiFiManager.h> // https://github.com/tzapu/WiFiManager
 
-#define CONFIG_PORTAL_TIMEOUT 180
+#define CONFIG_PORTAL_TIMEOUT 0
 
 #define CAMERA_MODEL_DFRobot_FireBeetle2_ESP32S3  // Has PSRAM
 #include "camera_pins.h"
 
-// ─── TFLite Micro includes ────────────────────────────────────────────────────
-// Raw TFLite Micro — no Eloquent wrapper, so arena can live in PSRAM
-#include <tflm_esp32.h>
-#include "tensorflow/lite/micro/micro_interpreter.h"
-#include "tensorflow/lite/micro/micro_mutable_op_resolver.h"
-#include "tensorflow/lite/schema/schema_generated.h"
+// Server-side CNN+LSTM plan:
+// The ESP32-S3 captures 160x160 color frames, JPEG-encodes them, and uploads them.
+// The server should keep a rolling frame buffer per device and run the fall model.
+#define FRAME_UPLOAD_INTERVAL_MS 500
+#define FRAME_WIDTH 160
+#define FRAME_HEIGHT 160
+#define FRAME_JPEG_QUALITY 80
+#define FRAME_UPLOAD_ERROR_BACKOFF_MS 5000
 
-// ─── Model specifications ─────────────────────────────────────────────────────
-#define INPUT_WIDTH       96
-#define INPUT_HEIGHT      96
-#define NUMBER_OF_INPUTS  (INPUT_WIDTH * INPUT_HEIGHT)  // 9216 — grayscale pixels
-#define NUMBER_OF_OUTPUTS 1                             // sigmoid output: P(fall)
-#define ARENA_SIZE        (380 * 1024)                  // allocated in PSRAM at runtime
-
-// ─── Detection thresholds ─────────────────────────────────────────────────────
-#define FALL_CONFIDENCE_THRESHOLD 0.85f  // Minimum confidence to trigger alert
-#define INFERENCE_INTERVAL_MS     5000   // Run inference every 2 s
-
-// ─── Debug stream toggle ──────────────────────────────────────────────────────
-// Camera can only be in one pixel format at a time. Grayscale is required for
-// inference, so the JPEG debug stream is disabled by default. Flip to true,
-// reflash, and check :81/stream to verify camera framing — then flip back.
 #define DEBUG_STREAM_ENABLED false
 
-String SERVER_REGISTER_URL = "https://server-fall-detection-app.onrender.com/api/v1/devices";
-String SERVER_ALERT_URL    = "https://server-fall-detection-app.onrender.com/api/v1/events";
+String SERVER_REGISTER_URL = "https://server-fall-detection-app-w7lr.onrender.com/api/v1/devices";
+String SERVER_FRAME_URL    = "https://server-fall-detection-app-w7lr.onrender.com/api/v1/frames";
 
 Preferences prefs;
 String apiKey   = "";
 String deviceId = "";
 
-// ─── Globals ──────────────────────────────────────────────────────────────────
 DFRobot_AXP313A axp;
-
-// TFLite Micro — pointers only; arena lives in PSRAM, not DRAM
-static uint8_t*                          tensor_arena = nullptr;
-static const tflite::Model*              model_ptr    = nullptr;
-static tflite::MicroInterpreter*         interpreter  = nullptr;
-static tflite::MicroMutableOpResolver<7> resolver;
-
-// Small input buffer in DRAM is fine — only 9216 bytes
-static int8_t   input_buffer[NUMBER_OF_INPUTS];
-static uint32_t last_inference_ms = 0;
+static uint32_t last_frame_upload_ms = 0;
+static uint32_t frame_upload_backoff_until_ms = 0;
+static uint32_t frame_sequence = 0;
 
 void startCameraServer();
 void setupLedFlash(int pin);
-void runInference();
-bool captureAndPreprocess();
 void setupTime();
 void setupApiKey(const char* userEmail);
 String registerDevice(const char* userEmail);
-bool sendFallAlert();
+bool uploadFrame();
 String getDeviceId();
 
-// ─────────────────────────────────────────────────────────────────────────────
 void setup() {
   Serial.begin(115200);
   Serial.setDebugOutput(true);
@@ -76,14 +52,12 @@ void setup() {
   deviceId = getDeviceId();
   Serial.println("Device ID: " + deviceId);
 
-  // ── Power management (must happen BEFORE esp_camera_init) ──────────────────
   while (axp.begin() != 0) {
     Serial.println("AXP313A init failed, retrying...");
     delay(1000);
   }
   axp.enableCameraPower(axp.eOV2640);
 
-  // ── Camera configuration ───────────────────────────────────────────────────
   camera_config_t config;
   config.ledc_channel  = LEDC_CHANNEL_0;
   config.ledc_timer    = LEDC_TIMER_0;
@@ -104,25 +78,16 @@ void setup() {
   config.pin_pwdn      = PWDN_GPIO_NUM;
   config.pin_reset     = RESET_GPIO_NUM;
   config.xclk_freq_hz  = 20000000;
-  config.grab_mode     = CAMERA_GRAB_WHEN_EMPTY;
+  config.pixel_format  = PIXFORMAT_RGB565;
+  config.frame_size    = FRAMESIZE_160X160;
+  config.jpeg_quality  = 12;
+  config.grab_mode     = CAMERA_GRAB_LATEST;
   config.fb_location   = CAMERA_FB_IN_PSRAM;
-  config.fb_count      = 1;
+  config.fb_count      = 2;
 
-  if (DEBUG_STREAM_ENABLED) {
-    config.pixel_format = PIXFORMAT_JPEG;
-    config.frame_size   = FRAMESIZE_QVGA;
-    config.jpeg_quality = 12;
-  } else {
-    config.pixel_format = PIXFORMAT_GRAYSCALE;
-    config.frame_size   = FRAMESIZE_96X96;
-  }
-
-  if (psramFound()) {
-    if (DEBUG_STREAM_ENABLED) config.jpeg_quality = 10;
-    config.fb_count  = 2;
-    config.grab_mode = CAMERA_GRAB_LATEST;
-  } else {
+  if (!psramFound()) {
     config.fb_location = CAMERA_FB_IN_DRAM;
+    config.fb_count = 1;
   }
 
 #if defined(CAMERA_MODEL_ESP_EYE)
@@ -156,7 +121,11 @@ void setup() {
   setupLedFlash(LED_GPIO_NUM);
 #endif
 
-  // ── WiFi ───────────────────────────────────────────────────────────────────
+// WIFI CONNECTION -------------------------------------------------------------------
+
+  WiFi.mode(WIFI_STA);
+  WiFi.setSleep(false);
+
   WiFiManager wm;
   WiFiManagerParameter custom_email("email", "your email", "mari@gmail.com", 254);
   wm.addParameter(&custom_email);
@@ -166,164 +135,133 @@ void setup() {
   wm.setDebugOutput(true);
   wm.setConfigPortalTimeout(CONFIG_PORTAL_TIMEOUT);
 
-  bool res = wm.autoConnect("AutoConnectAP", "password");
+  Serial.println("Starting WiFi setup portal if no saved network connects.");
+  Serial.println("Setup AP: BYOP-Camera-Setup");
+  Serial.println("Setup page: http://192.168.4.1");
+  bool res = wm.autoConnect("BYOP-Camera-Setup");
 
   if (!res) {
     Serial.println("Failed to connect");
-    delay(1000);
-    ESP.restart();
+    Serial.println("WiFi setup portal closed without credentials. Restart the board to try again.");
+    while (true) delay(1000);
   }
 
-  Serial.println("WiFi connected — IP: " + WiFi.localIP().toString());
+  Serial.println("WiFi connected. IP: " + WiFi.localIP().toString());
 
   const char* userEmail = custom_email.getValue();
   Serial.print("User email: ");
   Serial.println(userEmail);
 
-  setupTime();            // sync clock for reliable timestamps
-  setupApiKey(userEmail); // load or register API key
+  setupTime();
+  setupApiKey(userEmail);
 
-  // ── TFLite model init ──────────────────────────────────────────────────────
+//-----------------------------------------------------------------------------------------------
 
-  // 1. Allocate arena in PSRAM — avoids DRAM overflow
-  Serial.printf("Free PSRAM before arena: %d bytes\n", ESP.getFreePsram());
-  tensor_arena = (uint8_t*) ps_malloc(ARENA_SIZE);
-  if (!tensor_arena) {
-    Serial.println("PSRAM arena allocation failed — halting");
-    while (true) delay(1000);
-  }
-  Serial.printf("Arena allocated: %d KB in PSRAM\n", ARENA_SIZE / 1024);
-
-  // 2. Load and validate model
-  model_ptr = tflite::GetModel(fall_detection_model_tflite);
-  if (model_ptr->version() != TFLITE_SCHEMA_VERSION) {
-    Serial.printf("Model schema mismatch: got %d, expected %d\n",
-                  model_ptr->version(), TFLITE_SCHEMA_VERSION);
-    while (true) delay(1000);
-  }
-
-  // 3. Register ops — must match exactly what the model uses
-  resolver.AddConv2D();
-  resolver.AddMaxPool2D();
-  resolver.AddFullyConnected();
-  resolver.AddReshape();
-  resolver.AddQuantize();
-  resolver.AddDequantize();
-  resolver.AddLogistic();   // sigmoid output layer
-
-  // 4. Build interpreter and allocate tensors
-  static tflite::MicroInterpreter static_interpreter(
-      model_ptr, resolver, tensor_arena, ARENA_SIZE
-  );
-  interpreter = &static_interpreter;
-
-  if (interpreter->AllocateTensors() != kTfLiteOk) {
-    Serial.println("AllocateTensors() failed — halting");
-    while (true) delay(1000);
-  }
-
-  Serial.println("TFLite model loaded successfully");
-  Serial.printf("Arena used: %d bytes of %d\n",
-                interpreter->arena_used_bytes(), ARENA_SIZE);
-
-  // ── Camera web server (debug only — see DEBUG_STREAM_ENABLED) ─────────────
   if (DEBUG_STREAM_ENABLED) {
     startCameraServer();
     Serial.print("Camera stream: http://");
     Serial.print(WiFi.localIP());
     Serial.println(":81/stream");
   }
+
+  Serial.printf("Uploading JPEG frames to server every %d ms\n", FRAME_UPLOAD_INTERVAL_MS);
 }
 
-// ─────────────────────────────────────────────────────────────────────────────
 void loop() {
   uint32_t now = millis();
 
-  if (now - last_inference_ms >= INFERENCE_INTERVAL_MS) {
-    last_inference_ms = now;
-    runInference();
+  if (now >= frame_upload_backoff_until_ms &&
+      now - last_frame_upload_ms >= FRAME_UPLOAD_INTERVAL_MS) {
+    last_frame_upload_ms = now;
+    uploadFrame();
   }
 
-  // Keep WiFi alive / handle reconnects
   if (WiFi.status() != WL_CONNECTED) {
-    Serial.println("WiFi disconnected — attempting reconnect...");
+    Serial.println("WiFi disconnected. Attempting reconnect...");
     WiFi.reconnect();
   }
 
   delay(10);
 }
 
-// ─────────────────────────────────────────────────────────────────────────────
-// Capture a GRAYSCALE frame and convert uint8 [0,255] → int8 [-128,127]
-// ─────────────────────────────────────────────────────────────────────────────
-bool captureAndPreprocess() {
+bool uploadFrame() {
+  if (WiFi.status() != WL_CONNECTED) {
+    Serial.println("Skipping frame upload: WiFi is not connected.");
+    return false;
+  }
+
+  if (apiKey == "") {
+    Serial.println("Skipping frame upload: no API key available.");
+    return false;
+  }
+
   camera_fb_t *fb = esp_camera_fb_get();
   if (!fb) {
     Serial.println("Camera capture failed");
     return false;
   }
 
-  if (fb->format != PIXFORMAT_GRAYSCALE) {
+  if (fb->format != PIXFORMAT_RGB565) {
     esp_camera_fb_return(fb);
-    Serial.println("Warning: frame not grayscale — check pixel_format config");
+    Serial.println("Frame is not RGB565; check camera pixel_format config.");
     return false;
   }
 
-  if (fb->len < (size_t)NUMBER_OF_INPUTS) {
-    esp_camera_fb_return(fb);
-    Serial.println("Frame too small for model input");
-    return false;
-  }
-
-  // Shift uint8 [0,255] → int8 [-128,127] to match int8 quantized model input
-  for (int i = 0; i < NUMBER_OF_INPUTS; i++) {
-    input_buffer[i] = (int8_t)(fb->buf[i] - 128);
-  }
+  uint8_t *jpg_buf = nullptr;
+  size_t jpg_len = 0;
+  bool converted = fmt2jpg(fb->buf, fb->len, FRAME_WIDTH, FRAME_HEIGHT,
+                           PIXFORMAT_RGB565, FRAME_JPEG_QUALITY,
+                           &jpg_buf, &jpg_len);
 
   esp_camera_fb_return(fb);
-  return true;
-}
 
-// ─────────────────────────────────────────────────────────────────────────────
-// Run TFLite inference and trigger alert if fall detected
-// ─────────────────────────────────────────────────────────────────────────────
-void runInference() {
-  if (!captureAndPreprocess()) return;
-
-  // Copy preprocessed pixels into the model's input tensor
-  TfLiteTensor* input_tensor = interpreter->input(0);
-  memcpy(input_tensor->data.int8, input_buffer, NUMBER_OF_INPUTS);
-
-  // Run inference
-  if (interpreter->Invoke() != kTfLiteOk) {
-    Serial.println("Inference failed!");
-    return;
+  if (!converted || !jpg_buf || jpg_len == 0) {
+    Serial.println("JPEG conversion failed.");
+    if (jpg_buf) free(jpg_buf);
+    return false;
   }
 
-  // Dequantize int8 output → float probability using tensor's own scale/zero_point
-  TfLiteTensor* output_tensor = interpreter->output(0);
-  int8_t  raw        = output_tensor->data.int8[0];
-  float   scale      = output_tensor->params.scale;
-  int32_t zero_point = output_tensor->params.zero_point;
-  float   prob_fall  = (raw - zero_point) * scale;
+  uint32_t sequence = frame_sequence++;
+  time_t timestamp = time(nullptr);
 
-  Serial.printf("[Inference] Fall probability: %.2f\n", prob_fall);
+  HTTPClient http;
+  http.setTimeout(5000);
+  http.begin(SERVER_FRAME_URL);
+  http.addHeader("Content-Type", "image/jpeg");
+  http.addHeader("x-api-key", apiKey);
+  http.addHeader("x-device-id", deviceId);
+  http.addHeader("x-frame-sequence", String(sequence));
+  http.addHeader("x-frame-timestamp", String((long)timestamp));
 
-  if (prob_fall >= FALL_CONFIDENCE_THRESHOLD) {
-    Serial.println(">>> FALL DETECTED — sending alert");
-    sendFallAlert();
+  int httpCode = http.POST(jpg_buf, jpg_len);
+  bool success = (httpCode >= 200 && httpCode < 300);
+
+  if (success) {
+    Serial.printf("Uploaded frame %lu (%u bytes)\n", (unsigned long)sequence, jpg_len);
+    frame_upload_backoff_until_ms = 0;
+  } else if (httpCode == 404) {
+    Serial.println("Frame upload failed. HTTP 404");
+    Serial.println("The ESP32 is connected, but the server does not have POST /api/v1/frames.");
+    Serial.println("Add that backend route or change SERVER_FRAME_URL to an existing frame endpoint.");
+    frame_upload_backoff_until_ms = millis() + FRAME_UPLOAD_ERROR_BACKOFF_MS;
+  } else {
+    String response = http.getString();
+    Serial.printf("Frame upload failed. HTTP %d\n", httpCode);
+    Serial.println(response);
+    frame_upload_backoff_until_ms = millis() + FRAME_UPLOAD_ERROR_BACKOFF_MS;
   }
+
+  http.end();
+  free(jpg_buf);
+  return success;
 }
 
-// ─────────────────────────────────────────────────────────────────────────────
-// Syncs internal clock for reliable timestamps
-// ─────────────────────────────────────────────────────────────────────────────
 void setupTime() {
-  configTime(0, 0, "pool.ntp.org", "time.nist.gov");  // UTC, no DST
+  configTime(0, 0, "pool.ntp.org", "time.nist.gov");
 
   Serial.print("Waiting for NTP time sync");
   time_t now = time(nullptr);
-  while (now < 1700000000) {  // arbitrary "sane" epoch threshold (Nov 2023+)
+  while (now < 1700000000) {
     delay(500);
     Serial.print(".");
     now = time(nullptr);
@@ -332,9 +270,6 @@ void setupTime() {
   Serial.println("Time synced: " + String(now));
 }
 
-// ─────────────────────────────────────────────────────────────────────────────
-// Returns a stable hex string for this device's unique MAC-derived ID
-// ─────────────────────────────────────────────────────────────────────────────
 String getDeviceId() {
   uint64_t mac = ESP.getEfuseMac();
   char idStr[17];
@@ -343,35 +278,30 @@ String getDeviceId() {
   return String(idStr);
 }
 
-// ─────────────────────────────────────────────────────────────────────────────
-// Retrieve saved API key (registers with server if not saved)
-// ─────────────────────────────────────────────────────────────────────────────
 void setupApiKey(const char* userEmail) {
   prefs.begin("device", false);
   apiKey = prefs.getString("api_key", "");
 
   if (apiKey == "") {
-    Serial.println("No API key found — registering with server...");
+    Serial.println("No API key found. Registering with server...");
     apiKey = registerDevice(userEmail);
 
     if (apiKey != "") {
       prefs.putString("api_key", apiKey);
-      Serial.println("API key saved: " + apiKey);
+      Serial.println("API key saved.");
     } else {
-      Serial.println("Registration failed; will retry next boot");
+      Serial.println("Registration failed; will retry next boot.");
     }
   } else {
-    Serial.println("Loaded existing API key: " + apiKey);
+    Serial.println("Loaded existing API key.");
   }
 
   prefs.end();
 }
 
-// ─────────────────────────────────────────────────────────────────────────────
-// Registers ESP32 with the server and returns its unique API key
-// ─────────────────────────────────────────────────────────────────────────────
 String registerDevice(const char* userEmail) {
   HTTPClient http;
+  http.setTimeout(10000);
   http.begin(SERVER_REGISTER_URL);
   http.addHeader("Content-Type", "application/json");
 
@@ -383,7 +313,7 @@ String registerDevice(const char* userEmail) {
   int httpCode = http.POST(payload);
   String result = "";
 
-  if (httpCode == 201 || httpCode == 409) {  // created or already exists
+  if (httpCode == 201 || httpCode == 409) {
     String response = http.getString();
     Serial.println(response);
     JSONVar doc = JSON.parse(response);
@@ -395,49 +325,9 @@ String registerDevice(const char* userEmail) {
     }
   } else {
     Serial.printf("Registration HTTP error: %d\n", httpCode);
+    Serial.println(http.getString());
   }
 
   http.end();
   return result;
-}
-
-// ─────────────────────────────────────────────────────────────────────────────
-// Send HTTP POST alert to server
-// ─────────────────────────────────────────────────────────────────────────────
-bool sendFallAlert() {
-  if (WiFi.status() != WL_CONNECTED) {
-    Serial.println("WiFi is not connected.");
-    return false;
-  }
-
-  if (apiKey == "") {
-    Serial.println("No API key available.");
-    return false;
-  }
-
-  JSONVar payloadObj;
-  payloadObj["deviceId"]  = deviceId;
-  payloadObj["timestamp"] = (long) time(nullptr);
-  String payload = JSON.stringify(payloadObj);
-
-  HTTPClient http;
-  http.begin(SERVER_ALERT_URL);
-  http.addHeader("Content-Type", "application/json");
-  http.addHeader("x-api-key", apiKey);
-
-  int httpCode = http.POST(payload);
-  bool success = false;
-
-  if (httpCode == 201) {
-    String response = http.getString();
-    Serial.println(response);
-    success = true;
-  } else {
-    String response = http.getString();
-    Serial.printf("Alert failed — HTTP %d\n", httpCode);
-    Serial.println(response);
-  }
-
-  http.end();
-  return success;
 }
